@@ -172,7 +172,6 @@ export function decodeEmojiSkin(encoded: string): string {
   const codepoints = [...encoded];
   let i = 0;
   while (i < codepoints.length) {
-    const cp = codepoints[i];
     // Check if next is a skin tone modifier
     if (i + 1 < codepoints.length) {
       const mod = codepoints[i + 1];
