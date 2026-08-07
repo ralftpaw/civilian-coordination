@@ -27,6 +27,15 @@ export interface GuardFireRecord {
  * control corpus from looking fresh forever. `control_max_age_ms` is the
  * explicit freshness rule. `guard_skipped` makes enumerator blind spots visible
  * instead of letting a partial scan present as full coverage.
+ *
+ * `control_rejections_observed` / `control_rejections_expected` close the gap
+ * the three fields above leave open. They record that the control run was
+ * INVOKED; they do not record that it FIRED. A guard can drift so that the
+ * known-bad corpus stops tripping it while the producer keeps running the
+ * control on schedule: the timestamp stays fresh, the hash still matches
+ * because the corpus never changed, and the reader returns OK — stable, fresh,
+ * and vacuous. Only a count of what the control actually rejected separates a
+ * live control from a ceremonial one.
  */
 export interface GuardStamp {
   unit: string;
@@ -34,6 +43,10 @@ export interface GuardStamp {
   guard_control_at?: string | null;
   control_corpus_hash?: string | null;
   control_max_age_ms: number;
+  /** How many known-bad entries the control run actually caused the guard to reject. */
+  control_rejections_observed?: number | null;
+  /** How many the corpus named by `control_corpus_hash` is supposed to trip. */
+  control_rejections_expected?: number | null;
   guard_skipped?: string[];
   guard_fired_at?: GuardFireRecord | null;
 }
@@ -53,9 +66,16 @@ export interface StampReaderDecision {
     | "invalid_control_timestamp"
     | "missing_control_corpus_hash"
     | "invalid_control_max_age"
+    | "missing_control_result"
+    | "invalid_control_expected"
+    | "control_caught_nothing"
+    | "control_under_rejected"
     | "coverage_unaudited";
   coverage: Coverage;
   control_age_ms?: number;
+  /** Echoed so a reader can see the evidence the outcome turned on. */
+  control_rejections_observed?: number;
+  control_rejections_expected?: number;
   guard_skipped: string[];
 }
 
@@ -83,10 +103,15 @@ function blind(
     | "invalid_control_timestamp"
     | "missing_control_corpus_hash"
     | "invalid_control_max_age"
+    | "missing_control_result"
+    | "invalid_control_expected"
+    | "control_caught_nothing"
+    | "control_under_rejected"
     | "coverage_unaudited">,
   coverage: Coverage,
   guardSkipped: string[],
   controlAgeMs?: number,
+  counts?: { observed?: number; expected?: number },
 ): StampReaderDecision {
   return {
     unit: stamp.unit,
@@ -95,8 +120,15 @@ function blind(
     reason,
     coverage,
     control_age_ms: controlAgeMs,
+    control_rejections_observed: counts?.observed,
+    control_rejections_expected: counts?.expected,
     guard_skipped: guardSkipped,
   };
+}
+
+/** A non-negative integer, and not NaN/Infinity/"3"/null. */
+function isCount(value: unknown): value is number {
+  return typeof value === "number" && Number.isInteger(value) && value >= 0;
 }
 
 /**
@@ -105,8 +137,18 @@ function blind(
  * Interpretation rules:
  * - missing/stale control => BLIND, not OK;
  * - missing `guard_skipped` => BLIND because coverage was not audited;
- * - present `guard_fired_at` with fresh liveness proof => RED;
- * - recent control + no subject rejection => OK, silent, with exclusions surfaced.
+ * - missing rejection counts => BLIND: the control's invocation is proved, its
+ *   firing is not;
+ * - `control_rejections_expected === 0` => BLIND: a control that is supposed to
+ *   catch nothing is satisfied by an absent guard;
+ * - `control_rejections_observed === 0` => BLIND: the drifted-guard signature;
+ * - observed < expected => BLIND: the control is partially dead;
+ * - present `guard_fired_at` with a fresh AND FIRING control => RED;
+ * - fresh firing control + no subject rejection => OK, silent, exclusions surfaced.
+ *
+ * Every one of the new outcomes is BLIND rather than RED, for the reason the
+ * rest of this file already turns on: a dead control is a fact about our
+ * instrument, never evidence against the subject.
  */
 export function readGuardStamp(stamp: GuardStamp, now: Date = new Date()): StampReaderDecision {
   const { coverage, skipped } = coverageOf(stamp);
@@ -135,6 +177,48 @@ export function readGuardStamp(stamp: GuardStamp, now: Date = new Date()): Stamp
     return blind(stamp, "stale_control", coverage, skipped, controlAgeMs);
   }
 
+  // The control ran recently against a named corpus. Everything above proves
+  // INVOCATION. What follows is the only evidence that it FIRED.
+  const observed = stamp.control_rejections_observed;
+  const expected = stamp.control_rejections_expected;
+
+  if (!isCount(observed) || !isCount(expected)) {
+    // Absent result evidence is not a pass. A stamp that never says what the
+    // control caught cannot distinguish a working guard from a drifted one,
+    // and that is a statement about the instrument.
+    return blind(stamp, "missing_control_result", coverage, skipped, controlAgeMs, {
+      observed: isCount(observed) ? observed : undefined,
+      expected: isCount(expected) ? expected : undefined,
+    });
+  }
+
+  if (expected === 0) {
+    // A corpus expected to trip nothing certifies nothing: observed === expected
+    // is then satisfied by a guard that has been deleted. This is the same
+    // vacuous-denominator hole the rest of the schema exists to close, and it
+    // would otherwise be reachable by a one-character edit to the producer.
+    return blind(stamp, "invalid_control_expected", coverage, skipped, controlAgeMs, {
+      observed,
+      expected,
+    });
+  }
+
+  if (observed === 0) {
+    // Called out separately from a partial shortfall: a control that caught
+    // nothing at all is the drifted-guard signature, not a tuning problem.
+    return blind(stamp, "control_caught_nothing", coverage, skipped, controlAgeMs, {
+      observed,
+      expected,
+    });
+  }
+
+  if (observed < expected) {
+    return blind(stamp, "control_under_rejected", coverage, skipped, controlAgeMs, {
+      observed,
+      expected,
+    });
+  }
+
   if (stamp.guard_fired_at) {
     return {
       unit: stamp.unit,
@@ -143,6 +227,8 @@ export function readGuardStamp(stamp: GuardStamp, now: Date = new Date()): Stamp
       reason: "subject_rejected",
       coverage,
       control_age_ms: controlAgeMs,
+      control_rejections_observed: observed,
+      control_rejections_expected: expected,
       guard_skipped: skipped,
     };
   }
@@ -154,6 +240,8 @@ export function readGuardStamp(stamp: GuardStamp, now: Date = new Date()): Stamp
     reason: "fresh_control_no_subject_rejection",
     coverage,
     control_age_ms: controlAgeMs,
+    control_rejections_observed: observed,
+    control_rejections_expected: expected,
     guard_skipped: skipped,
   };
 }
